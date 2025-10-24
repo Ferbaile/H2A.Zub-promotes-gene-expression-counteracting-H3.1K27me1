@@ -1,0 +1,436 @@
+---
+title: "Epigenomic Clustering Analysis"
+author: "Javier Antunez Sanchez"
+date: "`r Sys.Date()`"
+output:
+  html_notebook:
+    theme: flatly
+    toc: true
+    toc_float: true
+    highlight: tango
+    code_folding: show
+---
+
+## Introduction
+
+This analysis aims to explore clustering of histone variants, modifications, and DNA methylation data for _Arabidopsis thaliana_ genes, or any other feature, based on several epigenomic marks. The clustering is performed using both standard k-means and PCA-based approaches, followed by visualization using heatmaps.
+
+```{r, warning=FALSE, message=FALSE, include=FALSE}
+# Load necessary libraries and functions
+#source("~/bin/R/enriched_heatmaps_functions.R")
+library(plyranges)
+library(EnrichedHeatmap)
+#library(rtracklayer)
+library(tidyverse)
+library(cluster)
+ht_opt$message = FALSE
+```
+
+## Functions
+
+```{r}
+# wraper for normalizeToMatrix
+normalise_to_matrix <- function(signal, target, extend = 2000, w = max(extend)/50,
+                               meth = FALSE, bed = FALSE,
+                               value_column = if(!bed) {"score"}, # trick to pass a NULL if bed is TRUE
+                               mapping_column = NULL, background = case_when(bed  ~ 0, .default = NA),
+                               mean_mode = case_when(meth ~ "absolute", bed  ~ "coverage", .default = "w0"),
+                               include_target = any(width(target) > 1),
+                               target_ratio = median(width(target))/(extend + median(width(target)) + extend),
+                               k = min(c(20, min(width(target)))), smooth = FALSE, smooth_fun = slider_median,
+                               keep = c(0, 0.99), flip_upstream = FALSE, na_to_zero = FALSE) {
+  mat <- normalizeToMatrix(
+    signal = signal, target = target, extend = extend, w = w, value_column = value_column, 
+    mapping_column = mapping_column, background = background, mean_mode = mean_mode, 
+    include_target = include_target, target_ratio = target_ratio, k = k, 
+    smooth = smooth, smooth_fun = smooth_fun, keep = keep, flip_upstream = flip_upstream
+  )
+  
+  if(na_to_zero) {
+    mat[is.na(mat)] <- 0
+  }
+  
+  return(mat)
+}
+```
+
+```{r}
+#Define a helper function that replaces NAs before scaling and then scales if needed
+replace_na_and_scale <- function(mat, scale_matrix = TRUE, na_replace_value = 0) {
+  # Replace NAs before scaling
+  mat[is.na(mat)] <- na_replace_value
+  # Apply scaling if requested
+  if (scale_matrix) {
+    mat <- scale(mat, center = TRUE, scale = TRUE)
+  } 
+  return(mat)
+}
+```
+
+```{r}
+# Function to trim a matrix by removing unnecessary flanking regions
+trim_matrix <- function(mat, u_start = 1, u_end = 45, d_start = 5, d_end = 50) {
+  
+  # Define the column names to remove (based on upstream 'u' and downstream 'd' ranges)
+  cols_to_remove <- c(paste0("u", u_start:u_end), paste0("d", d_start:d_end))
+  
+  # Get the column names of the matrix
+  col_names <- colnames(mat)
+  
+  # Find the indices of the columns to remove
+  cols_to_remove_indices <- which(col_names %in% cols_to_remove)
+  
+  # Filter the matrix to keep only the columns that are not in the 'cols_to_remove' list
+  mat_filtered <- mat[, -cols_to_remove_indices]
+  
+  # Return the filtered matrix
+  return(mat_filtered)
+}
+```
+
+```{r}
+# Function to handle clustering (with or without PCA)
+cluster_matrix <- function(matrix, number_of_clusters, use_pca = FALSE, variance_threshold = 0.80) {
+  # for reproducibility
+  set.seed(123)
+  
+  if (use_pca) {
+    # Perform PCA on the matrix
+    pca_result <- prcomp(matrix, scale. = TRUE)
+    
+    # Calculate cumulative variance explained
+    explained_variance <- pca_result$sdev^2 / sum(pca_result$sdev^2)
+    cumulative_variance <- cumsum(explained_variance)
+    
+    # Find the number of PCs that meet the variance threshold
+    num_pcs_to_use <- which(cumulative_variance >= variance_threshold)[1]
+    
+    # Print the number of PCs used
+    cat("Number of PCs explaining at least", variance_threshold * 100, "% of variance: ", num_pcs_to_use, "\n")
+    
+    # Use only the selected number of PCs
+    pcs <- pca_result$x[, 1:num_pcs_to_use]
+    
+    # Perform k-means clustering on the selected PCs
+    km <- kmeans(pcs, centers = number_of_clusters)$cluster
+  } else {
+    # No PCA: Directly perform k-means clustering on the original matrix
+    km <- kmeans(matrix, centers = number_of_clusters)$cluster
+  }
+  
+  return(km)
+}
+```
+
+```{r}
+# wraper for EnrichedHeatmap
+enriched_heatmap <- function(mat, col = c("white","red3"), split_col = NULL, y_lim = NULL, axis_presence = T,
+                            top_annotation = HeatmapAnnotation(enriched = anno_enriched(
+                              gp = gpar(col = split_col), pos_line = T, ylim = y_lim,
+                              axis_param = list(side = "right", at = if(!axis_presence) {NA}))
+                              ), # trick to convert T/F to NULL/NA
+                            row_order = order(enriched_score(mat), decreasing = TRUE), 
+                            pos_line = FALSE, pos_line_gp = gpar(lty = 2), axis_name = "kb", 
+                            axis_name_rot = 0, axis_name_gp = gpar(fontsize = 8), 
+                            border = TRUE, cluster_rows = FALSE, row_dend_reorder = -enriched_score(mat), 
+                            show_row_dend = FALSE, show_row_names = FALSE, 
+                            heatmap_legend_param = list(border=NA, direction = "horizontal"),
+                            use_raster = TRUE, raster_resize_mat = FALSE,
+                            #raster_device = "png", 
+                            raster_quality = 5, # after some experimentation, rawter_quality 5 gives not blurry images
+                            show_heatmap_legend = T,
+                            ...) {
+  if(axis_name == "kb") {
+    extend <- attr(mat, "extend") 
+    axis_name <- c(paste0("-", extend[1]/1000,"kb"), "", "", 
+                  paste0(extend[2]/1000,"kb"))
+  }
+  EnrichedHeatmap(mat = mat, col = col, top_annotation = top_annotation, row_order = row_order, pos_line = pos_line, 
+                  pos_line_gp = pos_line_gp, axis_name = axis_name, axis_name_rot = axis_name_rot, 
+                  axis_name_gp = axis_name_gp, border = border, cluster_rows = cluster_rows, row_dend_reorder = row_dend_reorder, 
+                  show_row_dend = show_row_dend, show_row_names = show_row_names, heatmap_legend_param = heatmap_legend_param, 
+                  use_raster = use_raster, raster_resize_mat = raster_resize_mat,
+                  #raster_by_magick = TRUE, raster_magick_filter = "Gaussian", 
+                  #raster_device = raster_device, 
+                  raster_quality = raster_quality, 
+                  show_heatmap_legend = show_heatmap_legend,
+                  ...)
+}
+```
+
+```{r}
+# color ramp from a Brewer palette
+brewer.ramp <- function(start, end, pal) {
+  palette = RColorBrewer::brewer.pal(n = RColorBrewer::brewer.pal.info[pal, "maxcolors"],  name = pal)
+  sequence = seq(start, end, (end - start)/(RColorBrewer::brewer.pal.info[pal, "maxcolors"] - 1))
+  ramp = circlize::colorRamp2(sequence, palette)
+  return(ramp)
+}
+```
+
+```{r}
+# plot heatmaps from a list (marks) of lists (samples)
+plot_heatmaps <- function(matrices, y_lims = NULL, col_funs = NULL, axis_presences = NULL, split_col = NULL, show_heatmap_legend = T, replace_underscores = " ",
+                          ...) {
+  heatmaps = list()
+  for (mark in names(matrices)) {
+    heatmaps[[mark]] = list()
+    if(is.null(col_funs[[mark]])) col_funs[[mark]] = c("white","red3")  # set default col
+    if(is.null(  y_lims[[mark]]))   y_lims[[mark]] = NULL               # set default y_lim
+    for(sample in names(matrices[[mark]])) {
+      if(is.null(axis_presences[[sample]])) axis_presences[[sample]] = T # set default axis_presence
+      heatmaps[[mark]][[sample]] = enriched_heatmap(mat = matrices[[mark]][[sample]], split_col = split_col, col = col_funs[[mark]], 
+                                                    y_lim = y_lims[[mark]], axis_presence = axis_presences[[sample]], 
+                                                    show_heatmap_legend = show_heatmap_legend, name=paste(sample,mark), 
+                                                    column_title=paste0(mark, "\n", str_replace_all(sample,"_", replace_underscores)),
+                                                    ...)
+    }
+  }
+  return(heatmaps)
+}
+```
+
+```{r}
+# Helper function to create heatmaps for partitions
+heatmap_partitions <- function(partition, colors, name = deparse(substitute(partition)), 
+                               show_heatmap_legend = FALSE) {
+  Heatmap(partition, col = colors, split = partition, name = name, show_row_names = FALSE, 
+          show_column_names = FALSE, row_title_rot = 0, width = unit(3, "mm"), border = FALSE, 
+          use_raster = TRUE, show_heatmap_legend = show_heatmap_legend)
+}
+```
+
+```{r}
+make_clustered_heatmap_list <- function(matrix_for_clustering, matrices_list, number_of_clusters, 
+                                        use_pca = FALSE, variance_threshold = 0.80,
+                                        col_funs = NULL, legends = NULL) {
+  # Step 1: Call the clustering function to get cluster assignments
+  km <- cluster_matrix(matrix_for_clustering, number_of_clusters, use_pca, variance_threshold)
+  
+  # Step 2: Set up colors for clusters
+  split_col <- scales::hue_pal()(number_of_clusters)
+  
+  # Step 3: Call plot_heatmaps() function to generate a list of heatmaps
+  list_of_heatmaps <- plot_heatmaps(matrices = matrices_list, split_col = split_col, 
+                                    show_heatmap_legend = is.null(legends), col_funs = col_funs, 
+                                    replace_underscores = "\n")
+  
+  # Step 4: Create a heatmap for the partitions (clusters) and add it to list
+  list_of_heatmaps$partition <- heatmap_partitions(km, split_col, name = "  ")
+  
+  # Step 5: save km as an element of the list
+  list_of_heatmaps$km <- km
+  
+  return(list_of_heatmaps)
+}
+```
+
+```{r}
+# wrapper for horizontal legend
+horizontal_legend <- function(col_fun, title) {
+  Legend(col_fun = col_fun, title = title, border=NA, direction = "horizontal", legend_width = unit(2, "cm"))
+}
+```
+
+# Figure version (4 variants, 4 marks)
+
+```{r}
+genes <- read_rds("data/Araport11-genes-named.RDS")
+
+rename_chr_TAIR = function(x) {
+  renameSeqlevels(x, c("1"="Chr1", "2"="Chr2", "3"="Chr3", "4"="Chr4", "5"="Chr5", "Mt"="ChrM", "Pt"="ChrC"))
+}
+
+# Load bigwigs
+bigwigs_figure <- list(
+  # Histone variants
+  H3.1. = read_bigwig("data/bigwig_GSM5824257_H3.1_WL_HTR13_1_IP.bw") %>% rename_chr_TAIR(),
+  H3.3  = read_bigwig("data/bigwig_GSM5824261_H3.3_WL_HTR5_1_IP.bw")  %>% rename_chr_TAIR(),
+  H2A.Z = read_bigwig("data/bigwig_GSM8631942_H2AZ_WT_IP1.bw")        %>% rename_chr_TAIR(),
+  HTA13 = read_bigwig("data/bigwig_GSE226469_HTA13.bw")               %>% rename_chr_TAIR(),
+  # Histone modifications
+  H3K27me1    = read_bigwig("data/bigwig_PRJEB36508_H3K27me1_WT_14dag.scaled.bw"),
+  H2Aub_7d    = read_bigwig("data/bigwig_SRR4734656_WT7D_H2Aub_IP1.bw") %>% rename_chr_TAIR(),
+  H3K27me3_7d = read_bigwig("data/bigwig_SRR4734660_H3K27me3_WT_7D.bw") %>% rename_chr_TAIR(),
+  H3K4me3_10d = read_bigwig("data/bigwig_PRJEB52473_H3K4me3_WT.bw")     %>% rename_chr_TAIR()
+)
+
+mats_figure <- list(
+  # Histone variants
+  H3.1  = list(wt = normalise_to_matrix(bigwigs_figure$H3.1,  genes)),
+  H3.3  = list(wt = normalise_to_matrix(bigwigs_figure$H3.3,  genes)),
+  H2A.Z = list(wt = normalise_to_matrix(bigwigs_figure$H2A.Z, genes)),
+  HTA13 = list(wt = normalise_to_matrix(bigwigs_figure$HTA13, genes)),
+  # Histone modifications
+  H3K27me1 = list(wt     = normalise_to_matrix(bigwigs_figure$H3K27me1,    genes)),
+  H2Aub    = list(wt_7d  = normalise_to_matrix(bigwigs_figure$H2Aub_7d,    genes)),
+  H3K27me3 = list(wt_7d  = normalise_to_matrix(bigwigs_figure$H3K27me3_7d, genes)),
+  H3K4me3  = list(wt_10d = normalise_to_matrix(bigwigs_figure$H3K4me3_10d, genes))
+)
+```
+
+Make combined matrix for clustering and trim it
+
+```{r}
+# Create the list of matrices and apply the function to each, then combine them
+mat <- mats_figure %>% 
+  # remove one layer of the list of lists
+  map(function(x) x[[1]]) %>% 
+  # Apply NA replacement and scaling
+  map(\(x) replace_na_and_scale(x, scale_matrix = TRUE, na_replace_value = 0)) %>% 
+  # Combine matrices by column
+  reduce(cbind)
+
+# trim matrix to remove flinking regions
+trimmed_mat <- trim_matrix(mat, u_start = 1, u_end = 45, d_start = 5, d_end = 50)
+```
+
+```{r}
+# Function to draw heatmaps with Fernando's data
+draw_heatmaps_figure <- function(matrix_for_clustering, matrices_list, number_of_clusters, 
+                               use_pca = FALSE, variance_threshold = 0.80,
+                               col_funs = NULL, legends = NULL,
+                               features = "1000 genes") {
+  
+  hms <- make_clustered_heatmap_list(matrix_for_clustering = matrix_for_clustering, matrices_list = matrices_list, 
+                                     number_of_clusters = number_of_clusters, use_pca = use_pca, 
+                                     variance_threshold = variance_threshold, legends = legends, col_funs = col_funs)
+  
+  # Step 5: Combine the partition heatmap with the other heatmaps
+  heatmap_list <- hms$partition +
+    hms$H3.1$wt + hms$H3.3$wt + hms$H2A.Z$wt + hms$HTA13$wt + 
+    hms$H3K27me1$wt +hms$H3K4me3$wt_10d + hms$H2Aub$wt_7d + hms$H3K27me3$wt_7d 
+  
+  # Step 6: Draw the heatmap list, applying row split based on clustering
+  draw(heatmap_list, row_split = hms$km, row_sub_title_side = "left", 
+       ht_gap = unit(c(2, rep(7, length(heatmap_list) - 1)), "mm"), row_gap = unit(2, "mm"),
+       column_title = gt_render(paste0("**", number_of_clusters, " clusters of ", features, "** based on epigenetic marks")),
+       main_heatmap = "wt H3.1", heatmap_legend_list = legends, heatmap_legend_side = "bottom")
+}
+```
+
+```{r}
+# the color scales are the same
+# color scales
+col_funs_figure <- list(H3.1 = brewer.ramp(0, 6, "RdPu"),
+                          H3.3 = brewer.ramp(0, 6, "Purples"), 
+                          H2A.Z = brewer.ramp(0, 4, "Oranges"),
+                          HTA13 = brewer.ramp(0, 2, "Greens"),
+                          H3K27me3 = brewer.ramp(0.5, 8, "BuPu"),  
+                          H2Aub = brewer.ramp(0, 6, "Reds"),   
+                          H3K4me3 = brewer.ramp(0.5, 14, "Blues"),  
+                          H3K27me1 = brewer.ramp(0.5, 3, "BuGn"))
+
+# legends for the color scales
+legends_figure <- packLegend(
+  horizontal_legend(col_fun = col_funs_figure$H3.1,     title = "H3.1"),
+  horizontal_legend(col_fun = col_funs_figure$H3.3,     title = "H3.3"),
+  horizontal_legend(col_fun = col_funs_figure$H2A.Z,    title = "H2A.Z"),
+  horizontal_legend(col_fun = col_funs_figure$HTA13,    title = "HTA13"),
+  horizontal_legend(col_fun = col_funs_figure$H3K27me1,      title = "H3K27me1"),
+  horizontal_legend(col_fun = col_funs_figure$H3K4me3,  title = "H3K4me3"),
+  horizontal_legend(col_fun = col_funs_figure$H2Aub,    title = "H2Aub"),
+  horizontal_legend(col_fun = col_funs_figure$H3K27me3, title = "H3K27me3"),
+  direction = "horizontal", column_gap = unit(5, "mm")#, max_width = unit(7, "in")
+)
+```
+
+```{r, message=FALSE, warning=FALSE, fig.width=8, fig.height=8}
+draw_heatmaps_figure(matrix_for_clustering = trimmed_mat, matrices_list = mats_figure, 
+                   number_of_clusters = 8, features = "All genes",
+                   col_funs = col_funs_figure, legends = legends_figure)
+```
+
+
+```{r, message=FALSE, warning=FALSE, fig.width=8, fig.height=8}
+draw_heatmaps_figure(matrix_for_clustering = trimmed_mat, matrices_list = mats_figure, 
+                   number_of_clusters = 8, features = "All genes",
+                   col_funs = col_funs_figure, legends = legends_figure)
+```
+
+### Scaled clustering
+
+```{r}
+dir.create("figures", showWarnings = FALSE)
+pdf("figures/heatmap-clusters-minimum.pdf", width = 12, height = 12)
+1:14 %>% 
+  map(\(x) draw_heatmaps_figure(matrix_for_clustering = trimmed_mat, matrices_list = mats_figure, 
+                              number_of_clusters = x, features = "1000 genes",
+                              col_funs = col_funs_figure, legends = legends_figure))
+invisible(dev.off())
+```
+
+### Scaled + PCA clustering
+
+```{r}
+pdf("figures/heatmap-clusters-minimum-PCA.pdf", width = 12, height = 12)
+1:14 %>% 
+  map(\(x) draw_heatmaps_figure(matrix_for_clustering = trimmed_mat, matrices_list = mats_figure, 
+                              number_of_clusters = x, features = "1000 genes", use_pca = TRUE,
+                              col_funs = col_funs_figure, legends = legends_figure))
+invisible(dev.off()) 
+
+```
+
+# Rename clusters
+
+```{r, message=FALSE, warning=FALSE, fig.width=8, fig.height=8}
+number_of_clusters = 6
+features = "All genes"
+
+hms <- make_clustered_heatmap_list(matrix_for_clustering = trimmed_mat, matrices_list = mats_figure, 
+                                   number_of_clusters = number_of_clusters, use_pca = TRUE,
+                                   col_funs = col_funs_figure, legends = legends_figure)
+
+# Step 5: Combine the other heatmaps
+heatmap_list <- hms$H3.1$wt + hms$H3.3$wt + hms$H2A.Z$wt + hms$HTA13$wt + 
+    hms$H3K27me1$wt + hms$H3K4me3$wt_10d + hms$H2Aub$wt_7d + hms$H3K27me3$wt_7d
+
+hms$partition + heatmap_list
+```
+
+```{r, message=FALSE, warning=FALSE, fig.width=8, fig.height=8}
+hms$km <- hms$km %>%
+  str_replace("^5", "TE like") %>%
+  str_replace("^1", "H3K27me3\n& H2Aub") %>%
+  str_replace("^2", "H2Aub &\nH3K4me3") %>%
+  str_replace("^6", "H2Aub &\nH3K27me1") %>%
+  str_replace("^4", "H3K4me3 TSS") %>%
+  str_replace("^3", "No marks") %>% 
+  factor(levels = c("H3K27me3\n& H2Aub", "H2Aub &\nH3K27me1", "H2Aub &\nH3K4me3",
+                    "H3K4me3 TSS", "No marks", "TE like"))
+
+hms$partition <- heatmap_partitions(hms$km, colors = scales::hue_pal()(number_of_clusters), name = "  ")
+
+hms$partition + heatmap_list
+```
+
+```{r, message=FALSE, warning=FALSE, fig.width=10, fig.height=10}
+draw(hms$partition + heatmap_list, row_split = hms$km, row_sub_title_side = "left", 
+     ht_gap = unit(c(2, rep(7, length(heatmap_list) - 1)), "mm"), row_gap = unit(2, "mm"),
+     column_title = gt_render(paste0("**", number_of_clusters, " clusters of ", features, "** based on epigenetic marks")),
+     main_heatmap = "wt H3.1", heatmap_legend_list = legends_figure, heatmap_legend_side = "bottom")
+```
+
+```{r}
+pdf("figures/heatmap-clusters-minimum-PCA-renamed.pdf", width = 10, height = 12)
+draw(hms$partition + heatmap_list, row_split = hms$km, row_sub_title_side = "left", 
+     ht_gap = unit(c(2, rep(7, length(heatmap_list) - 1)), "mm"), row_gap = unit(2, "mm"),
+     column_title = gt_render(paste0("**", number_of_clusters, " clusters of ", features, "**\nbased on 4 Histone Variants and 4 Histone Modifications")),
+     main_heatmap = "wt H3.1", heatmap_legend_list = legends_figure, heatmap_legend_side = "bottom")
+invisible(dev.off()) 
+```
+
+save the clusters as a file
+
+```{r}
+genes$clusters_8_marks = hms$km %>% 
+  str_replace("\n", " ")
+
+# Save clusters to a TSV file
+genes %>% 
+  as_tibble() %>% 
+  select(ID, clusters_8_marks) %>% 
+  write_tsv("data/Araport11-genes-by-8-clusters-of-8-epigenomic-marks.tsv")
+```
+

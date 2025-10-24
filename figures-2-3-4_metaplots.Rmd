@@ -1,0 +1,129 @@
+---
+title: "Metaplots for Genome Biology paper"
+author: "Javier Antunez Sanchez"
+date: "`r Sys.Date()`"
+output:
+  html_notebook:
+    theme: flatly
+    toc: true
+    toc_float: true
+    highlight: tango
+    code_folding: show
+---
+
+# Introduction
+
+This analysis aims to produce the Metagene plots for the manuscript "PRC1-mediated H2A.Zub promotes gene expression by preventing H3.1K27me1 incorporation in Arabidopsis"
+
+```{r for-enriched-heatmaps, warning=FALSE, message=FALSE, include=FALSE}
+# Load necessary libraries and functions
+library(EnrichedHeatmap)
+library(plyranges)
+library(tidyverse)
+library(TxDb.Athaliana.BioMart.plantsmart51)
+ht_opt$message = FALSE
+```
+
+# Functions
+
+To compute signal over genes
+
+```{r normalise-to-matrix-version}
+average.signal.metagene_faster <- function(bigwig.file, gene.set, txdb, upstream=2000, n.body=100, n.flank=25, filter.th=50) {
+  # Subset genes of interest
+  genes <- genes(txdb) %>% 
+    filter(gene_id %in% gene.set,
+           width > 100)
+  # Read bigwig
+  coverage <- read_bigwig(bigwig.file) #%>%
+    # renameSeqlevels(c("Chr1"="1", "Chr2"="2", "Chr3"="3", "Chr4"="4", "Chr5"="5", "ChrM"="Mt", "ChrC"="Pt"))
+  # Compute matrix including upstrea and downstream. w and target ration to match 150 windows in total
+  mat <- normalizeToMatrix(signal = coverage, target = genes, extend = 2000, w = 80, target_ratio = 2/3,
+                           value_column = "score", mean_mode = "w0", background = NA, keep = c(0, 0.99))
+  
+  #mat <- normalise_to_matrix(signal = coverage, target = genes, extend = 2000, w = 80, target_ratio = 2/3)
+  
+  
+  # make a list with the same names (bad names as they include spaces), `complete signal` becomes the enriched matrix
+  list(`mean signal` = colMeans(mat, na.rm=TRUE) %>% unname(),
+       `complete signal` = mat)
+}
+```
+
+To load several bigwigs at once
+
+```{r function-metagene-data}
+load_metagene_data <- function(bigwigs, gene_set) {
+  # 1. make an empty list of the same length as bigwigs
+  metagene_data <- vector("list", length(bigwigs))
+  names(metagene_data) <- names(bigwigs)
+  
+  # 2. fill it
+  for (nm in names(bigwigs)) {
+    metagene_data[[nm]] <- average.signal.metagene_faster(bigwig.file = bigwigs[[nm]], gene.set = gene_set, txdb = txdb)
+  }
+  
+  return(metagene_data)
+}
+```
+
+To plot metagene plot
+
+```{r function-plot-metagene}
+# Generic plotting function that adapts to any number of samples
+plot_metagene <- function(metagene_data, y_lims = c(0, 3), colors, title = "Metagene", y_lab = "Coverage", cex_base = 1.3, legend_text = NULL) {
+  sample_names <- names(colors)
+  if (is.null(legend_text)) legend_text <- sample_names
+
+  par(lend = 2, mar = c(5, 4, 2, 1))
+  # 1) set up an empty plotting region
+  plot(NA, NA, xlim = c(1, 150), ylim = y_lims, type = "n", axes = FALSE, xlab = "", ylab = "")
+  # 2) draw axes
+  axis(side = 1, at = c(1, 25, 58, 91, 125, 150), labels = c("-2000","TSS","33%","66%","TES","2000"), cex.axis = cex_base, lwd = 2, las = 2)
+  axis(side = 2, at = seq(from = 0, to = y_lims[2], by = (y_lims[2] - y_lims[1]) / 2),                cex.axis = cex_base, lwd = 2, las = 1)
+  # 3) title and y-label
+  mtext(text = title, side = 3, cex = cex_base * 1.2, line = 0)
+  mtext(text = y_lab, side = 2, cex = cex_base,       line = 2.4)
+  # 4) loop over each sample in your data & draw its line
+  for (sample in sample_names) {
+    lines(metagene_data[[sample]][["mean signal"]], col = colors[sample], lwd = 3)
+  }
+  # 5) legend
+  legend("topright", legend = legend_text, col = colors, lwd = 5, seg.len = 0.7, x.intersp = 0.8, y.intersp = 0.8, cex = cex_base * 1.2, bty = "n")
+}
+```
+
+# Load data
+
+```{r}
+# load txdb
+txdb <- TxDb.Athaliana.BioMart.plantsmart51
+
+# Gene lists
+genes_example  <- read_rds("data/Araport11-genes-named.RDS") %>% 
+  head(1000) %>% 
+  names()
+
+# bigwigs of H3K27me3
+bigwigs_me3 = c(wt     = "data/bigwig_SRR4734660_H3K27me3_WT_7D.bw" #,
+                #bmi1 = "data/bigwig_bmi1abc_7D_me3_GB.bw",
+                #ref6 = "data/bigwigs_ref6_ChIP-seq_H3K27me3.bw"
+                )
+```
+
+## Plot
+
+```{r}
+metaplot_data <- load_metagene_data(bigwigs_me3, genes_example)
+```
+
+```{r fig.height=6.5, fig.width=6}
+legend_1 <- c(wt = "WT 7D", ref6 = expression(italic("ref6")), bmi1 = expression(italic("bmi1abc")))
+
+plot_metagene(metaplot_data, y_lims = c(0, 3), colors = c(wt = "blue1",   ref6 = "#A4D7FF", bmi1 = "#8DAEF2"), title = "H3K27me3", legend_text = legend_1)
+# Title
+mtext("Fig 4A.  H3K27me3 in WT, ref6, bmi1abc (2313)", outer = TRUE, cex = 1, line = 1.5, font = 2)
+
+# copy the current plot to a PDF
+invisible(dev.copy2pdf(file = "figures/metaplot.pdf", height = 6.5, width = 6))
+```
